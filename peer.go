@@ -130,11 +130,11 @@ func (p *Peer) Torrent() *Torrent {
 
 func (p *Peer) Stats() (ret PeerStats) {
 	p.locker().RLock()
-	defer p.locker().RUnlock()
 	ret.ConnStats = p._stats.Copy()
 	ret.DownloadRate = p.downloadRate()
 	ret.LastWriteUploadRate = p.peerImpl.lastWriteUploadRate()
 	ret.RemotePieceCount = p.remotePieceCount()
+	p.locker().RUnlock()
 	return
 }
 
@@ -235,8 +235,8 @@ func (p *Peer) close() {
 
 func (p *Peer) Close() error {
 	p.locker().Lock()
-	defer p.locker().Unlock()
 	p.close()
+	p.locker().Unlock()
 	return nil
 }
 

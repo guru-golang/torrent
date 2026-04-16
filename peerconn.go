@@ -131,8 +131,9 @@ func (*PeerConn) allConnStatsImplField(stats *AllConnStats) *ConnStats {
 
 func (cn *PeerConn) lastWriteUploadRate() float64 {
 	cn.messageWriter.mu.Lock()
-	defer cn.messageWriter.mu.Unlock()
-	return cn.messageWriter.dataUploadRate
+	dur := cn.messageWriter.dataUploadRate
+	cn.messageWriter.mu.Unlock()
+	return dur
 }
 
 func (cn *PeerConn) pexStatus() string {
@@ -701,12 +702,15 @@ func (c *PeerConn) startPeerRequestServer() {
 }
 
 func (c *PeerConn) peerRequestServer() {
-	c.locker().Lock()
 again:
-	if !c.closed.IsSet() {
-		for r := range c.unreadPeerRequests {
-			c.servePeerRequest(r)
-			goto again
+	{
+		c.locker().Lock()
+		if !c.closed.IsSet() {
+			for r := range c.unreadPeerRequests {
+				c.locker().Unlock()
+				c.servePeerRequest(r)
+				goto again
+			}
 		}
 	}
 	panicif.False(c.peerRequestServerRunning)
@@ -726,25 +730,27 @@ func (c *PeerConn) peerRequestDataBuffered() (n int) {
 func (c *PeerConn) waitForDataAlloc(size int) bool {
 	maxAlloc := c.t.cl.config.MaxAllocPeerRequestDataPerConn
 	locker := c.locker()
+	if size > maxAlloc {
+		c.slogger.Warn("peer request length exceeds MaxAllocPeerRequestDataPerConn",
+			"requested", size,
+			"max", maxAlloc)
+		return false
+	}
+
 	for {
-		if size > maxAlloc {
-			c.slogger.Warn("peer request length exceeds MaxAllocPeerRequestDataPerConn",
-				"requested", size,
-				"max", maxAlloc)
-			return false
-		}
+		locker.Lock()
 		if c.peerRequestDataBuffered()+size <= maxAlloc {
+			locker.Unlock()
 			return true
 		}
+
 		allocDecreased := c.peerRequestDataAllocDecreased.Signaled()
 		locker.Unlock()
 		select {
 		case <-c.closedCtx.Done():
-			locker.Lock()
 			return false
 		case <-allocDecreased:
 		}
-		c.locker().Lock()
 	}
 }
 
@@ -761,32 +767,33 @@ func (me *PeerConn) deleteReadyPeerRequest(r Request) {
 
 // Handles an outstanding peer request. It's either rejected, or buffered for the writer.
 func (c *PeerConn) servePeerRequest(r Request) {
-	defer func() {
-		// Prevent caller from stalling. It's either rejected or buffered.
-		panicif.True(g.MapContains(c.unreadPeerRequests, r))
-	}()
 	if !c.waitForDataAlloc(r.Length.Int()) {
-		// Might have been removed while unlocked.
+		c.locker().Lock()
 		if g.MapContains(c.unreadPeerRequests, r) {
 			c.useBestReject(r)
 		}
+		c.locker().Unlock()
 		return
 	}
-	c.locker().Unlock()
+
 	b, err := c.readPeerRequestData(r)
+
 	c.locker().Lock()
 	if err != nil {
 		c.peerRequestDataReadFailed(err, r)
+		c.locker().Unlock()
 		return
 	}
 	if !g.MapContains(c.unreadPeerRequests, r) {
 		c.slogger.Debug("read data for peer request but no longer wanted", "request", r)
+		c.locker().Unlock()
 		return
 	}
 	g.MustDelete(c.unreadPeerRequests, r)
 	g.MakeMapIfNil(&c.readyPeerRequests)
 	c.readyPeerRequests[r] = b
 	c.tickleWriter()
+	c.locker().Unlock()
 }
 
 // If this is maintained correctly, we might be able to support optional synchronous reading for

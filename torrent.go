@@ -164,6 +164,7 @@ type Torrent struct {
 	// received that piece.
 	metadataCompletedChunks []bool
 	metadataChanged         sync.Cond
+	metadataFinalizing      bool
 
 	// Closed when .Info is obtained. This could be chansync.SetOnce but we already have sync around
 	// IsSet from nameMu. Switching will probably only increase memory use.
@@ -308,7 +309,6 @@ func (t *Torrent) KnownSwarm() (ks []PeerInfo) {
 
 	// Add active peers to the list
 	t.cl.rLock()
-	defer t.cl.rUnlock()
 	for conn := range t.conns {
 		ks = append(ks, PeerInfo{
 			Id:     conn.PeerID,
@@ -323,6 +323,7 @@ func (t *Torrent) KnownSwarm() (ks []PeerInfo) {
 			SupportsEncryption: conn.headerEncrypted,
 		})
 	}
+	t.cl.rUnlock()
 
 	return
 }
@@ -514,8 +515,9 @@ files:
 
 func (t *Torrent) AddPieceLayers(layers map[string]string) (errs []error) {
 	t.cl.lock()
-	defer t.cl.unlock()
-	return t.addPieceLayersLocked(layers)
+	errs = t.addPieceLayersLocked(layers)
+	t.cl.unlock()
+	return
 }
 
 // Returns the index of the first file containing the piece. files must be
@@ -550,18 +552,25 @@ func (t *Torrent) cacheLength() {
 
 // TODO: This shouldn't fail for storage reasons. Instead we should handle storage failure
 // separately.
-func (t *Torrent) setInfo(info *metainfo.Info) error {
-	if err := validateInfo(info); err != nil {
-		return fmt.Errorf("bad info: %w", err)
+func (t *Torrent) openInfoStorage(info *metainfo.Info) (*storage.Torrent, error) {
+	if t.storageOpener == nil {
+		return nil, nil
 	}
+	ctx := log.ContextWithLogger(context.Background(), t.logger)
+	opened, err := t.storageOpener.OpenTorrent(ctx, info, *t.canonicalShortInfohash())
+	if err != nil {
+		return nil, fmt.Errorf("error opening torrent storage: %w", err)
+	}
+	return opened, nil
+}
+
+func (t *Torrent) applyInfoLocked(info *metainfo.Info, opened *storage.Torrent) {
 	if t.storageOpener != nil {
-		var err error
-		ctx := log.ContextWithLogger(context.Background(), t.logger)
-		t.storage, err = t.storageOpener.OpenTorrent(ctx, info, *t.canonicalShortInfohash())
-		if err != nil {
-			return fmt.Errorf("error opening torrent storage: %w", err)
-		}
+		t.storage = opened
 	}
+	t.metadataFinalizing = false
+	t.metadataCompletedChunks = nil
+	t.metadataBytes = nil
 	t.nameMu.Lock()
 	t.info = info
 	panicif.True(t.fileSegmentsIndex.Set(info.FileSegmentsIndex()).Ok)
@@ -573,6 +582,17 @@ func (t *Torrent) setInfo(info *metainfo.Info) error {
 	t.initFiles()
 	t.cacheLength()
 	t.makePieces()
+}
+
+func (t *Torrent) setInfo(info *metainfo.Info) error {
+	if err := validateInfo(info); err != nil {
+		return fmt.Errorf("bad info: %w", err)
+	}
+	opened, err := t.openInfoStorage(info)
+	if err != nil {
+		return err
+	}
+	t.applyInfoLocked(info, opened)
 	return nil
 }
 
@@ -680,15 +700,75 @@ func (t *Torrent) setInfoBytesLocked(b []byte) (err error) {
 	return nil
 }
 
+func (t *Torrent) queueInfoBytesFinalizationLocked(b []byte, invalidateOnMetadataError bool) {
+	if len(b) == 0 || t.info != nil || t.metadataFinalizing || t.closed.IsSet() {
+		return
+	}
+	infoBytes := append([]byte(nil), b...)
+	t.metadataBytes = infoBytes
+	t.metadataFinalizing = true
+	go t.finalizeInfoBytesAsync(infoBytes, invalidateOnMetadataError)
+}
+
+func (t *Torrent) finalizeInfoBytesAsync(b []byte, invalidateOnMetadataError bool) {
+	var info metainfo.Info
+	if err := bencode.Unmarshal(b, &info); err != nil {
+		t.finishInfoFinalizationError(fmt.Errorf("unmarshalling info bytes: %w", err), true, invalidateOnMetadataError)
+		return
+	}
+	if err := validateInfo(&info); err != nil {
+		t.finishInfoFinalizationError(fmt.Errorf("bad info: %w", err), true, invalidateOnMetadataError)
+		return
+	}
+	opened, err := t.openInfoStorage(&info)
+	if err != nil {
+		t.finishInfoFinalizationError(err, false, invalidateOnMetadataError)
+		return
+	}
+
+	t.cl.lock()
+	if t.closed.IsSet() || t.info != nil {
+		t.metadataFinalizing = false
+		t.cl.unlock()
+		return
+	}
+	if err := t.hashInfoBytes(b, &info); err != nil {
+		t.metadataFinalizing = false
+		if invalidateOnMetadataError {
+			t.invalidateMetadata()
+		}
+		t.logger.WithDefaultLevel(log.Warning).Printf("error hashing info bytes: %v", err)
+		t.cl.unlock()
+		return
+	}
+	t.applyInfoLocked(&info, opened)
+	t.onSetInfo()
+	if t.cl.config.Debug {
+		t.logger.Printf("%s: got metadata from peers", t)
+	}
+	t.cl.unlock()
+}
+
+func (t *Torrent) finishInfoFinalizationError(err error, metadataError bool, invalidateOnMetadataError bool) {
+	t.cl.lock()
+	t.metadataFinalizing = false
+	if metadataError && invalidateOnMetadataError {
+		t.invalidateMetadata()
+	}
+	t.logger.WithDefaultLevel(log.Warning).Printf("error finalizing info bytes: %v", err)
+	t.cl.unlock()
+}
+
 // Used in tests.
 func (t *Torrent) setInfoUnlocked(info *metainfo.Info) (err error) {
 	t.cl.lock()
-	defer t.cl.unlock()
 	err = t.setInfo(info)
 	if err != nil {
+		t.cl.unlock()
 		return
 	}
 	t.onSetInfo()
+	t.cl.unlock()
 	return
 }
 
@@ -732,13 +812,15 @@ func (t *Torrent) setMetadataSize(size int) (err error) {
 // name if the info isn't known yet.
 func (t *Torrent) bestName() (_ g.Option[string]) {
 	t.nameMu.RLock()
-	defer t.nameMu.RUnlock()
 	if t.haveInfo() {
+		t.nameMu.RUnlock()
 		return g.Some(t.info.BestName())
 	}
 	if t.displayName != "" {
+		t.nameMu.RUnlock()
 		return g.Some(t.displayName)
 	}
+	t.nameMu.RUnlock()
 	return
 }
 
@@ -1859,14 +1941,7 @@ func (t *Torrent) maybeCompleteMetadata() error {
 		// Don't have enough metadata pieces.
 		return nil
 	}
-	err := t.setInfoBytesLocked(t.metadataBytes)
-	if err != nil {
-		t.invalidateMetadata()
-		return fmt.Errorf("error setting info bytes: %w", err)
-	}
-	if t.cl.config.Debug {
-		t.logger.Printf("%s: got metadata from peers", t)
-	}
+	t.queueInfoBytesFinalizationLocked(t.metadataBytes, true)
 	return nil
 }
 
@@ -1952,12 +2027,14 @@ func (t *Torrent) bytesCompleted() int64 {
 
 func (t *Torrent) SetInfoBytes(b []byte) (err error) {
 	t.cl.lock()
-	defer t.cl.unlock()
 	err = t.getClosedErr()
 	if err != nil {
+		t.cl.unlock()
 		return
 	}
-	return t.setInfoBytesLocked(b)
+	err = t.setInfoBytesLocked(b)
+	t.cl.unlock()
+	return
 }
 
 // Returns true if connection is removed from torrent.Conns.
@@ -2120,11 +2197,11 @@ func (t *Torrent) onWebRtcConn(
 	}
 	pc.conn.SetWriteDeadline(time.Time{})
 	t.cl.lock()
-	defer t.cl.unlock()
 	err = t.runHandshookConn(pc)
 	if err != nil {
 		t.logger.WithDefaultLevel(log.Debug).Printf("error running handshook webrtc conn: %v", err)
 	}
+	t.cl.unlock()
 }
 
 func (t *Torrent) logRunHandshookConn(pc *PeerConn, logAll bool, level log.Level) {
@@ -2435,8 +2512,9 @@ func (t *Torrent) addPeersIter(peers iter.Seq[PeerInfo]) (added int) {
 // https://github.com/anacrolix/torrent/issues/383.
 func (t *Torrent) Stats() TorrentStats {
 	t.cl.rLock()
-	defer t.cl.rUnlock()
-	return t.statsLocked()
+	stats := t.statsLocked()
+	t.cl.rUnlock()
+	return stats
 }
 
 func (t *Torrent) gauges() (ret TorrentGauges) {
@@ -2587,7 +2665,6 @@ func (t *Torrent) wantIncomingConns() bool {
 
 func (t *Torrent) SetMaxEstablishedConns(max int) (oldMax int) {
 	t.cl.lock()
-	defer t.cl.unlock()
 	oldMax = t.maxEstablishedConns
 	t.maxEstablishedConns = max
 	wcs := worseConnSlice{
@@ -2601,6 +2678,7 @@ func (t *Torrent) SetMaxEstablishedConns(max int) (oldMax int) {
 		t.dropConnection(heap.Pop(&wcs).(*PeerConn))
 	}
 	t.openNewConns()
+	t.cl.unlock()
 	return oldMax
 }
 
@@ -2787,11 +2865,14 @@ func (t *Torrent) startSinglePieceHasher() bool {
 func (t *Torrent) pieceHasher(initial pieceIndex) {
 	t.finishHash(initial)
 	for {
+		t.cl.lock()
 		if t.closed.IsSet() {
+			t.cl.unlock()
 			break
 		}
 		piOpt := t.getPieceToHash()
 		if !piOpt.Ok {
+			t.cl.unlock()
 			break
 		}
 		pi := piOpt.Value
@@ -2799,6 +2880,7 @@ func (t *Torrent) pieceHasher(initial pieceIndex) {
 		t.cl.unlock()
 		t.finishHash(pi)
 	}
+	t.cl.lock()
 	t.cl.startPieceHashers()
 	t.cl.unlock()
 }
@@ -2848,8 +2930,8 @@ func (t *Torrent) dropBannedPeers() {
 	})
 }
 
-// Storage lock is held. Release storage lock after we're done reading and relock Client. Return
-// with Client lock still held.
+// Storage lock is held. Release storage lock after we're done reading, reacquire the Client lock
+// for the commit phase, then unlock before returning.
 func (t *Torrent) finishHash(index pieceIndex) {
 	p := t.piece(index)
 	// Do we really need to spell out that it's a copy error? If it's a failure to hash the hash
@@ -2886,6 +2968,7 @@ func (t *Torrent) finishHash(index pieceIndex) {
 		t.deferUpdateComplete()
 	}
 	t.cl.activePieceHashers--
+	t.cl.unlock()
 }
 
 // Return the connections that touched a piece, and clear the entries while doing it.
@@ -3065,8 +3148,8 @@ func (t *Torrent) onWriteChunkErr(err error) {
 
 func (t *Torrent) DisallowDataDownload() {
 	t.cl.lock()
-	defer t.cl.unlock()
 	t.disallowDataDownloadLocked()
+	t.cl.unlock()
 }
 
 func (t *Torrent) disallowDataDownloadLocked() {
@@ -3079,49 +3162,49 @@ func (t *Torrent) disallowDataDownloadLocked() {
 }
 
 func (t *Torrent) AllowDataDownload() {
-	t.cl.lock()
-	defer t.cl.unlock()
 	// Can't move this outside the lock because other users require it to be unchanged while the
 	// Client lock is held?
 	if !t.dataDownloadDisallowed.Clear() {
 		return
 	}
+	t.cl.lock()
 	t.updateAllPiecePriorities("data download allowed")
 	t.iterPeers(func(p *Peer) {
 		p.onNeedUpdateRequests("allow data download")
 	})
+	t.cl.unlock()
 }
 
 // Enables uploading data, if it was disabled.
 func (t *Torrent) AllowDataUpload() {
-	t.cl.lock()
-	defer t.cl.unlock()
 	if !t.dataUploadDisallowed {
 		return
 	}
+	t.cl.lock()
 	t.dataUploadDisallowed = false
 	t.iterPeers(func(p *Peer) {
 		p.onNeedUpdateRequests("allow data upload")
 	})
+	t.cl.unlock()
 }
 
 // Disables uploading data, if it was enabled.
 func (t *Torrent) DisallowDataUpload() {
 	t.cl.lock()
-	defer t.cl.unlock()
 	t.dataUploadDisallowed = true
 	for c := range t.conns {
 		// TODO: This doesn't look right. Shouldn't we tickle writers to choke peers or something instead?
 		c.onNeedUpdateRequests("disallow data upload")
 	}
+	t.cl.unlock()
 }
 
 // Sets a handler that is called if there's an error writing a chunk to local storage. By default,
 // or if nil, a critical message is logged, and data download is disabled.
 func (t *Torrent) SetOnWriteChunkError(f func(error)) {
 	t.cl.lock()
-	defer t.cl.unlock()
 	t.userOnWriteChunkErr = f
+	t.cl.unlock()
 }
 
 func (t *Torrent) iterPeers(f func(p *Peer)) {
@@ -3156,10 +3239,10 @@ func WebSeedResponseBodyRateLimiter(rl *rate.Limiter) AddWebSeedsOpt {
 }
 
 func (t *Torrent) AddWebSeeds(urls []string, opts ...AddWebSeedsOpt) {
-	t.cl.lock()
-	defer t.cl.unlock()
 	for _, u := range urls {
+		t.cl.lock()
 		t.addWebSeed(u, opts...)
+		t.cl.unlock()
 	}
 }
 

@@ -321,7 +321,7 @@ func (cl *Client) init(cfg *ClientConfig) {
 	}
 
 	cl.websocketTrackers = websocketTrackers{
-		PeerId: cl.peerID,
+		PeerId:  cl.peerID,
 		Slogger: cl.slogger.With("name", "websocketTrackers"),
 		GetAnnounceRequest: func(
 			event tracker.AnnounceEvent, infoHash [20]byte,
@@ -1230,11 +1230,12 @@ const peerUpdateRequestsTimerReason = "updateRequestsTimer"
 
 func (c *PeerConn) updateRequestsTimerFunc() {
 	c.locker().Lock()
-	defer c.locker().Unlock()
 	if c.closed.IsSet() {
+		c.locker().Unlock()
 		return
 	}
 	if c.isLowOnRequests() {
+		c.locker().Unlock()
 		// If there are no outstanding requests, then a request update should have already run.
 		return
 	}
@@ -1242,9 +1243,11 @@ func (c *PeerConn) updateRequestsTimerFunc() {
 		// These should be benign, Timer.Stop doesn't guarantee that its function won't run if it's
 		// already been fired.
 		torrent.Add("spurious timer requests updates", 1)
+		c.locker().Unlock()
 		return
 	}
 	c.onNeedUpdateRequests(peerUpdateRequestsTimerReason)
+	c.locker().Unlock()
 }
 
 // Maximum pending requests we allow peers to send us. If peer requests are buffered on read, this
@@ -1527,7 +1530,9 @@ func (cl *Client) AddTorrentOpt(opts AddTorrentOpts) (t *Torrent, new bool) {
 		}
 	})
 	cl.torrentsByShortHash[infoHash] = t
-	t.setInfoBytesLocked(opts.InfoBytes)
+	if len(opts.InfoBytes) > 0 {
+		t.queueInfoBytesFinalizationLocked(opts.InfoBytes, false)
+	}
 	cl.clearAcceptLimits()
 	t.updateWantPeersEvent()
 	// Tickle Client.waitAccept, new torrent may want conns.
