@@ -447,8 +447,7 @@ func (t *Torrent) makePieces() {
 	for i := range t.pieces {
 		piece := &t.pieces[i]
 		piece.t = t
-		piece.index = i
-		piece.noPendingWrites.L = &piece.pendingWritesMutex
+		piece.index = int32(i)
 		if t.info.HasV1() {
 			piece.hash = (*metainfo.Hash)(unsafe.Pointer(
 				unsafe.SliceData(t.info.Pieces[i*sha1.Size : (i+1)*sha1.Size])))
@@ -457,8 +456,8 @@ func (t *Torrent) makePieces() {
 		// TODO: This can be done more efficiently by retaining a file iterator between loops.
 		beginFile := pieceFirstFileIndex(piece.torrentBeginOffset(), files)
 		endFile := pieceEndFileIndex(piece.torrentEndOffset(), files)
-		piece.beginFile = beginFile
-		piece.endFile = endFile
+		piece.beginFile = int32(beginFile)
+		piece.endFile = int32(endFile)
 	}
 }
 
@@ -618,7 +617,7 @@ func (t *Torrent) onSetInfo() {
 		if p.relativeAvailability != 0 {
 			panic(p.relativeAvailability)
 		}
-		p.relativeAvailability = t.selectivePieceAvailabilityFromPeers(i)
+		p.relativeAvailability = int32(t.selectivePieceAvailabilityFromPeers(i))
 		t.addRequestOrderPiece(i)
 		t.setInitialPieceCompletionFromStorage(i)
 		t.queueInitialPieceCheck(i)
@@ -844,7 +843,7 @@ func (t *Torrent) pieceState(index pieceIndex) (ret PieceState) {
 	if ret.Ok && !ret.Complete && t.piecePartiallyDownloaded(index) {
 		ret.Partial = true
 	}
-	if t.info.HasV2() && !p.hashV2.Ok && p.hasPieceLayer() {
+	if t.info.HasV2() && p.hashV2 == nil && p.hasPieceLayer() {
 		ret.MissingPieceLayerHash = true
 	}
 	return
@@ -1097,6 +1096,19 @@ func (t *Torrent) writePeerStatuses(w io.Writer, peers iter.Seq[*Peer]) {
 
 func (t *Torrent) haveInfo() bool {
 	return t.info != nil
+}
+
+// isPrivate reports whether the torrent's metainfo carries BEP 27's
+// `private=1` flag. Private torrents must not be announced via DHT, must
+// not participate in PEX, and must not be discovered or announced via
+// Local Peer Discovery (BEP 14). Returns false when info has not yet been
+// loaded (e.g. magnet that hasn't fetched metadata yet) — callers that need
+// to be conservative should also check haveInfo().
+func (t *Torrent) isPrivate() bool {
+	if t.info == nil {
+		return false
+	}
+	return t.info.Private != nil && *t.info.Private
 }
 
 // Returns a run-time generated MetaInfo that includes the info bytes and
@@ -1376,7 +1388,7 @@ func (t *Torrent) hashPiece(piece pieceIndex) (
 		var sum [20]byte
 		sumExactly(sum[:], h.Sum)
 		correct = sum == *p.hash
-	} else if p.hashV2.Ok {
+	} else if p.hashV2 != nil {
 		h := merkle.NewHash()
 		differingPeers, err = t.hashPieceWithSpecificHash(piece, h)
 		var sum [32]byte
@@ -1386,7 +1398,7 @@ func (t *Torrent) hashPiece(piece pieceIndex) (
 		sumExactly(sum[:], func(b []byte) []byte {
 			return h.SumMinLength(b, int(t.info.PieceLength))
 		})
-		correct = sum == p.hashV2.Value
+		correct = sum == *p.hashV2
 	} else {
 		expected := p.mustGetOnlyFile().piecesRoot.Unwrap()
 		h := merkle.NewHash()
@@ -2464,6 +2476,11 @@ func (t *Torrent) dhtAnnouncer(s DhtServer) {
 			if t.closed.IsSet() {
 				return
 			}
+			// BEP 27: private torrents must not be announced via DHT. We re-check
+			// every loop because info may be loaded later (e.g. via magnet).
+			if t.isPrivate() {
+				goto wait
+			}
 			// We're also announcing ourselves as a listener, so we don't just want peer addresses.
 			// TODO: We can include the announce_peer step depending on whether we can receive
 			// inbound connections. We should probably only announce once every 15 mins too.
@@ -2791,7 +2808,7 @@ func (t *Torrent) pieceHashed(piece pieceIndex, passed bool, hashIoErr error) {
 		// Set it directly without querying storage again. It makes no difference if the lock is
 		// held since it can be clobbered right after again anyway. This comes after inCompletePiece
 		// because that's how it was before.
-		t.setPieceCompletion(p.index, g.Some(false))
+		t.setPieceCompletion(p.Index(), g.Some(false))
 	}
 }
 
@@ -3704,13 +3721,13 @@ file:
 		key := f.piecesRoot.Value
 		var value strings.Builder
 		for i := f.BeginPieceIndex(); i < f.EndPieceIndex(); i++ {
-			hashOpt := t.piece(i).hashV2
-			if !hashOpt.Ok {
+			hashPtr := t.piece(i).hashV2
+			if hashPtr == nil {
 				// All hashes must be present. This implementation should handle missing files, so
 				// move on to the next file.
 				continue file
 			}
-			value.Write(hashOpt.Value[:])
+			value.Write(hashPtr[:])
 		}
 		if value.Len() == 0 {
 			// Non-empty files are not recorded in piece layers.
@@ -3832,8 +3849,8 @@ func (t *Torrent) expandPieceRangeToFullFiles(beginPieceIndex, endPieceIndex pie
 	if beginPieceIndex == endPieceIndex {
 		return beginPieceIndex, endPieceIndex
 	}
-	firstFile := t.getFile(t.piece(beginPieceIndex).beginFile)
-	lastFile := t.getFile(t.piece(endPieceIndex-1).endFile - 1)
+	firstFile := t.getFile(int(t.piece(beginPieceIndex).beginFile))
+	lastFile := t.getFile(int(t.piece(endPieceIndex-1).endFile) - 1)
 	expandedBegin = firstFile.BeginPieceIndex()
 	expandedEnd = lastFile.EndPieceIndex()
 	return
